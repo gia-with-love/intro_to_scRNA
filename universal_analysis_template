@@ -1,0 +1,162 @@
+# READ THIS BEFORE TOUCHING ANY CODE:
+#
+# rule #1: you should always know what biological question your code answers
+#   you should be able to answer the question: 'this step does ____ because ___'
+#
+# rule #2: before adding/removing ANY line of code:
+#   - click Seurat object in environment tab (top right)
+#   - expand all dropdowns (assays, meta.data, reductions, etc)
+#   - confirm whether the thing you want already exists (90% of the time, it's already there)
+
+
+# ==============================================================================
+# 0) load libraries/packages (these are the 'toolboxes' with our tools)
+# ==============================================================================
+library(Seurat) # main scRNA-seq analysis toolkit
+library(dplyr) # data manipulation
+library(ggplot2) # pretty plots and colour palettes
+library(patchwork) # for combining plots on the same image so you dont print out 500 single plots
+# you usually don't need as many packages as you think you do, these 4 are the main ones
+
+# ==============================================================================
+# 1) load RDS object ("what cells do we even have data for?")
+#
+# assume the Seurat object probs already contains:
+# - gene expression counts
+# - metadata per cell
+# - possibly previous analysis results
+#
+# DO NOT reload matrices or tags unless you confirm they are missing from obj
+# ==============================================================================
+
+SeuratObject <- readRDS("~/Desktop/Path/Folder/your_seurat_obj_file.rds") 
+# tip: for the first run, stick with ONE NAME ONLY, you can do extra runs/analysis later
+# too many names messes up downstream analysis
+
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# PITSTOP CHECKPOINT 
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#
+# go into SeuratObject and expand all dropdowns and sk yourself:
+# - do Sample_Tag / Sample_Name already exist?
+# - is RNA assay present?
+# - are nFeature_RNA / nCount_RNA present?
+# IF YES → DO NOT ADD THEM AGAIN
+#
+# we can also do what comp people call 'sanity checks'
+# (handy because we can stop pipeline if something is wrong/missing)
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+stopifnot("Sample_Tag" %in% colnames(SeuratObject@meta.data))
+stopifnot("Sample_Name" %in% colnames(SeuratObject@meta.data))
+
+table(SeuratObject$Sample_Tag, useNA = "ifany")
+# this tells us how many cells belong to each sample tag
+# NA here means unassigned / failed tagging
+
+# ==============================================================================
+# 2) filtering ("which cells are real high quality single cells?")
+#
+# REMOVING:
+# - Multiplets (likely doublets)
+# - Undetermined tags (ambiguous assignment)
+# we are NOT changing expression data here, only deciding which cells to keep
+#
+# FILTERING:
+# - how many genes per cell?
+# - how much mitochondrial RNA?
+# high mito % = stressed/dying cells
+# too few genes = empty droplets
+# too many genes = possible doublets
+# ==============================================================================
+
+obj <- SeuratObject
+
+obj <- subset(
+  obj,
+  subset = !is.na(Sample_Tag) &
+           Sample_Tag != "Multiplet" &
+           Sample_Tag != "Undetermined"
+)
+
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3
+)
+
+# IMPORTANT:
+# Look at the violin plots BEFORE filtering.
+# Do NOT blindly trust thresholds copied from elsewhere.
+
+obj <- subset(
+  obj,
+  subset = nFeature_RNA > 1000 &
+           nFeature_RNA < 4000 &
+           percent.mt < 10
+)
+
+# ==============================================================================
+# 3) normalising ("do cells naturally group by expression patterns?")
+#
+# this is the STANDARD Seurat workflow.
+# DO NOT add extra steps unless you can explain why.
+# ==============================================================================
+
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj, nfeatures = 2000)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+
+ElbowPlot(obj, ndims = 50)
+# use this plot to decide how many PCs capture real signal
+# https://devopedia.org/principal-component-analysis
+
+pcs_use <- 1:30 # find the 'elbow' 
+
+obj <- FindNeighbors(obj, dims = pcs_use)
+obj <- FindClusters(obj, resolution = 0.5) 
+obj <- RunUMAP(obj, dims = pcs_use)
+# ask yourself how many celltypes you expect in your data, number of clusters = number of celltypes
+# there's lots of ways of going about clustering/celltyping if you wanna go down that rabbit hole
+# https://medium.com/data-science/10-tips-for-choosing-the-optimal-number-of-clusters-277e93d72d92
+
+
+DimPlot(obj, label = TRUE) + NoLegend()
+DimPlot(obj, group.by = "Sample_Tag")
+
+# ==============================================================================
+# 4) finding markers ("which genes define each cluster?")
+#
+# this step is about ANNOTATION and INTERPRETATION, not filtering or re-clustering
+# ==============================================================================
+
+DefaultAssay(obj) <- "RNA"
+
+all_markers <- FindAllMarkers(
+  obj,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+top10 <- all_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+# open up and inspect all_markers/top10 or you can write.csv() and open it up in excel
+
+DoHeatmap(obj, features = top10$gene) + NoLegend()
+
+# ==============================================================================
+# congrats! you just analysed scRNA data! you now have:
+# - quality controlled cells
+# - clusters based on gene expression
+# - marker genes for interpretation
+#
+# from here, you can do extra analyses based on the question you want to answer
+# (e.g. differential gene expression, sub-clustering, pathway enrichment, etc.)
+# ==============================================================================
