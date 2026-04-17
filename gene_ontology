@@ -1,0 +1,774 @@
+# ==============================================================================
+# INTRO TO GO ANALYSIS FOR SINGLE-CELL RNA-SEQ  (immunology edition)
+# ==============================================================================
+#
+# This script walks through Gene Ontology (GO) enrichment analysis end-to-end,
+# aimed at someone in wet lab who's done basic Seurat clustering and
+# wants to know what the pathways actually MEAN:
+#
+#   1. What GO actually IS (the database, the structure, the biology)
+#   2. Over-representation analysis (ORA)  --  the hypergeometric test
+#   3. Gene Set Enrichment Analysis (GSEA)  --  the ranking-based test
+#   4. When to use which, and how to read the output without fooling yourself
+#   5. How to cross-check in a web browser (Enrichr, CELLxGENE, GO website)
+#
+# Rule of this script: every single code block should answer a biological
+# question. If you can't state the question, don't run the code.
+#
+# ==============================================================================
+# 0) WHAT IS GO? (read this before touching code)
+# ==============================================================================
+#
+# The Gene Ontology is a controlled vocabulary of biological concepts. Three
+# separate ontologies, and you pick ONE at a time when you run analysis:
+#
+#   BP = Biological Process   -- "T cell activation", "cytokine production"
+#                                 (what the cell is DOING)
+#   MF = Molecular Function   -- "MHC class II binding", "kinase activity"
+#                                 (what a protein physically DOES at the bench)
+#   CC = Cellular Component   -- "immunological synapse", "endosome membrane"
+#                                 (WHERE in the cell)
+#
+# For an immunology lab, BP is almost always the starting point. MF is useful
+# when you're thinking about druggable targets; CC is niche but sometimes
+# tells you localisation stories (e.g. "MHC-II loading compartment").
+#
+# Each ontology is a directed acyclic graph (DAG). Think of it as a tree
+# where "child" terms are more specific than "parent" terms, BUT a child can
+# have multiple parents (hence DAG, not strict tree).
+#
+#     immune system process
+#            |
+#     immune response
+#            |
+#     adaptive immune response
+#            |
+#     T cell mediated immunity
+#            |
+#     CD4-positive, alpha-beta T cell activation   <-- very specific
+#
+# Each GO term has a list of genes annotated to it by curators reading
+# primary literature. When you "run GO analysis" you are asking:
+#
+#     "Is my gene list enriched for any of these curated buckets,
+#      more than you'd expect by chance?"
+#
+# THE BIG IMPLICATION: GO is HUMAN-CURATED and LITERATURE-BIASED.
+# Immune genes are among the best-annotated in the entire genome because
+# immunology gets a lot of funding and a lot of papers. This is GREAT for
+# you -- your signal-to-noise is high compared to, say, someone working on
+# obscure metabolic enzymes. But it also means GO tends to pull your results
+# toward "classic" immune pathways even when something novel is happening.
+# Keep that in mind: absence of a weird pathway in GO doesn't mean the
+# biology isn't there, it might just not have been curated yet.
+#
+# Also: GO is hierarchical and redundant on purpose. If "T cell activation"
+# is enriched, the parent term "lymphocyte activation" will probably also be
+# enriched because they share most of the same genes. Don't interpret every
+# enriched term as an independent finding -- read the DAG structure.
+
+
+# ==============================================================================
+# 1) LOAD PACKAGES
+# ==============================================================================
+
+library(Seurat)           # we assume you already have a Seurat object
+library(dplyr)            # data wrangling
+library(ggplot2)          # plots
+library(clusterProfiler)  # does the actual enrichment maths (Yu et al. 2012)
+library(org.Hs.eg.db)     # human gene annotation database
+                          # if you're on mouse: use org.Mm.eg.db
+                          # other species: AnnotationHub / Bioconductor
+library(enrichplot)       # pretty plots of GO results (dotplot, emapplot)
+library(DOSE)             # helper plotting functions
+library(msigdbr)          # optional -- lets you pull MSigDB immune gene sets
+                          # (C7: immunologic signatures) for extra
+                          # immunology-specific context
+
+
+# ==============================================================================
+# 2) LOAD DATA + QUICK SANITY CHECK
+# ==============================================================================
+#
+# We assume you already have:
+#   - a Seurat object with clusters defined  (seurat_obj)
+#   - OR a marker table from FindAllMarkers()
+#
+# DO NOT re-cluster, re-normalise, or re-QC here. This script is strictly
+# about: gene list --> pathway interpretation. Upstream = upstream.
+
+seurat_obj <- readRDS("path/to/your/seurat_obj.rds")
+
+# ++ PITSTOP CHECKPOINT ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# click seurat_obj in the Environment pane. Confirm:
+#   - @meta.data has seurat_clusters (or your named identity column)
+#   - DefaultAssay is set sensibly ("RNA" is the right choice for marker
+#     discovery; SCT's corrected counts can distort DE stats)
+#   - rownames are GENE SYMBOLS (e.g. "CD4"), not Ensembl IDs
+# if any of that is missing STOP and fix it upstream. Do not bodge it here.
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+stopifnot("seurat_clusters" %in% colnames(seurat_obj@meta.data))
+DefaultAssay(seurat_obj) <- "RNA"
+
+
+# ==============================================================================
+# 3) GET THE GENE LISTS: FindAllMarkers
+# ==============================================================================
+#
+# Biological question: "what genes define each cluster?"
+#
+# FindAllMarkers runs a Wilcoxon rank-sum test per gene, per cluster, comparing
+# that cluster vs all others. Output columns:
+#   p_val       -- raw p-value from Wilcoxon
+#   avg_log2FC  -- log2 fold change (cluster vs rest)
+#   pct.1       -- fraction of cells in the cluster expressing the gene
+#   pct.2       -- fraction of cells outside the cluster expressing it
+#   p_val_adj   -- Bonferroni-adjusted p-value across ALL genes tested
+#   cluster     -- which cluster this marker belongs to
+#   gene        -- gene symbol
+#
+# NOTE on `only.pos`:
+#   only.pos = TRUE  -->  keep genes UP in the cluster vs rest (standard)
+#   only.pos = FALSE -->  keep up AND down. Needed for GSEA later because GSEA
+#                          wants a signed ranking, not just a list of "up" hits
+#
+# So we run BOTH flavours:
+
+markers_pos <- FindAllMarkers(
+  seurat_obj,
+  only.pos       = TRUE,
+  min.pct        = 0.25,   # gene must be detected in >=25% of cells in at
+                            # least one group -- filters junk
+  logfc.threshold= 0.25     # require at least 0.25 log2FC -- also filters junk
+)
+
+markers_both <- FindAllMarkers(
+  seurat_obj,
+  only.pos       = FALSE,
+  min.pct        = 0.25,
+  logfc.threshold= 0.25
+)
+
+# Always inspect before using:
+head(markers_pos)
+table(markers_pos$cluster)   # how many markers per cluster?
+                              # if one cluster has 3 markers and another has
+                              # 900 -- interpret with suspicion
+
+
+# ==============================================================================
+# 4) OVER-REPRESENTATION ANALYSIS (ORA) -- the maths
+# ==============================================================================
+#
+# THIS IS WHAT THE enrichGO FUNCTION DOES.
+#
+# The question ORA asks:
+#   "Given I pulled out N 'interesting' genes from a background of M genes,
+#    is any GO term represented MORE OFTEN in my N than you'd expect if I'd
+#    just drawn N genes at random from M?"
+#
+# It's a 2x2 contingency table per GO term:
+#
+#                           in my list   NOT in my list
+#     annotated to term       k             K - k
+#     NOT annotated           n - k         M - K - n + k
+#
+#   where
+#     M = total genes in the background universe
+#     K = total genes annotated to this GO term (in the universe)
+#     n = size of my gene list
+#     k = how many of my list are annotated to this term
+#
+# The test is the HYPERGEOMETRIC (same as Fisher's exact, one-sided). It gives
+# you a p-value answering: "is k bigger than expected?"
+#
+# EXPECTED value of k under the null:
+#     E[k] = n * K / M
+# So if E[k] = 2 and you observed k = 15, that's surprising --> small p-value.
+#
+# CRITICAL THINGS THAT WILL TRIP YOU UP:
+#
+# (a) BACKGROUND UNIVERSE MATTERS A LOT.
+#     The default universe in enrichGO is "all genes in org.Hs.eg.db" which is
+#     the whole annotated genome. But your Seurat object only DETECTED a
+#     subset of genes! If you don't pass a `universe` argument, you're
+#     implicitly asking "is my list enriched vs the whole genome" when you
+#     should be asking "is my list enriched vs what was detectable in this
+#     experiment". This usually INFLATES significance for tissue-specific
+#     terms that would have been enriched in your background anyway.
+#     --> ALWAYS set `universe = rownames(seurat_obj)` or similar.
+#
+# (b) ORA IS THRESHOLD-DEPENDENT.
+#     You picked min.pct=0.25, logfc=0.25, p_val_adj<0.05. Those thresholds
+#     ARE the analysis. Change them --> different gene list --> different GO
+#     result. Don't cherry-pick thresholds to make pretty pathways appear.
+#
+# (c) MULTIPLE TESTING.
+#     GO BP has ~30,000 terms. You test all of them. Default correction is
+#     Benjamini-Hochberg (BH / FDR). clusterProfiler does this for you.
+#     Report q-values (adjusted), not raw p-values.
+#
+# (d) REDUNDANCY.
+#     See section 0: child+parent terms will BOTH pop up. That's not two
+#     findings. That's one finding at two resolutions.
+
+
+# ==============================================================================
+# 5) ORA IN PRACTICE
+# ==============================================================================
+
+# Filter markers sensibly. This is the student's first judgement call.
+# Rule of thumb: top 100-300 genes per cluster sorted by log2FC is plenty for
+# GO. Too few (< 20) and you get no power. Too many (> 1000) and you dilute
+# the signal with noise.
+
+markers_for_ora <- markers_pos %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC), .by_group = TRUE) %>%
+  slice_head(n = 200) %>%
+  ungroup()
+
+# Build the background universe from what your data actually measured:
+universe_genes <- rownames(seurat_obj)
+length(universe_genes)   # sanity check. Should be ~15-25k for human scRNA-seq.
+
+# Run enrichGO cluster-by-cluster. We store results in a named list.
+#
+# WHY A LIST, NOT ONE BIG TABLE:
+# Each cluster is its OWN enrichment question. The p-values aren't comparable
+# across clusters out of the box. Keep them separate until you decide how
+# you want to compare.
+
+clusters <- sort(unique(markers_for_ora$cluster))
+ora_results <- list()
+
+for (cl in clusters) {
+
+  # Q: which genes are we testing for this cluster?
+  gene_list <- markers_for_ora %>%
+    filter(cluster == cl) %>%    # Use `cl`, NOT `cluster`, as the loop
+                                   # variable. If you name the loop var
+                                   # `cluster` it silently shadows the
+                                   # column name and you get weird results.
+    pull(gene)
+
+  message("Cluster ", cl, ": testing ", length(gene_list), " genes")
+
+  # Q: does this cluster have enough genes to even test?
+  if (length(gene_list) < 10) {
+    message("  skipping -- too few genes")
+    next
+  }
+
+  ego <- enrichGO(
+    gene          = gene_list,
+    universe      = universe_genes,   # << (a) from section 4 -- do not skip
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",          # our genes are symbols like "CD4"
+                                        # if yours are Ensembl: "ENSEMBL"
+                                        # if Entrez IDs: "ENTREZID"
+    ont           = "BP",              # Biological Process (pick BP/MF/CC)
+    pAdjustMethod = "BH",              # Benjamini-Hochberg FDR correction
+    pvalueCutoff  = 0.05,              # filter RAW p before adjustment
+    qvalueCutoff  = 0.05,              # filter FDR-adjusted q (the one
+                                        # you actually report)
+    readable      = TRUE,              # converts gene IDs in the output
+                                        # back to symbols so you can read them
+    minGSSize     = 10,                # skip GO terms smaller than this
+                                        # (tiny terms are unstable)
+    maxGSSize     = 500                 # skip huge generic terms like
+                                        # "biological_process" (uninformative)
+  )
+
+  ora_results[[as.character(cl)]] <- ego
+}
+
+# Inspect a cluster you care about. Say cluster 3 is your putative Treg-like
+# cluster based on marker genes:
+head(as.data.frame(ora_results[["3"]]))
+
+# Columns you'll see:
+#   ID            -- GO accession, e.g. GO:0002250
+#   Description   -- human-readable, e.g. "adaptive immune response"
+#   GeneRatio     -- k/n  (how many of your genes hit this term / list size)
+#   BgRatio       -- K/M  (how many genes in the universe hit this term / M)
+#   pvalue        -- raw hypergeometric p
+#   p.adjust      -- BH-adjusted p (this is your q-value; report this)
+#   qvalue        -- a slightly different q from Storey's method (Storey 2002)
+#   geneID        -- the actual genes from YOUR list that hit the term
+#   Count         -- k (integer -- how many of yours hit)
+#
+# BIOLOGICAL READING RULE (IMMUNOLOGY FLAVOUR):
+# Always open the geneID column. If "T cell activation" is enriched but the
+# geneID column is actually just CD3D, CD3E, CD3G, TRAC, TRBC1 -- congrats,
+# you found "these cells have T cell receptors", not "T cell activation".
+# The genes must make sense AS A FUNCTIONAL SET, not just as lineage markers.
+# A good immunologist reads the gene IDs first, the term name second.
+
+
+# ==============================================================================
+# 6) VISUALISING ORA
+# ==============================================================================
+
+# Dotplot -- top terms, dot size = Count, colour = p.adjust
+dotplot(ora_results[["3"]], showCategory = 15) +
+  ggtitle("Cluster 3 -- top GO BP terms")
+
+# Enrichment map -- groups redundant terms together visually.
+# This is the ANTIDOTE to the "parent + child both appear" problem.
+# Terms that share many genes get clustered in the plot.
+ego_pairwise <- pairwise_termsim(ora_results[["3"]])
+emapplot(ego_pairwise, showCategory = 30)
+
+# cnetplot -- shows which GENES are driving which TERMS (network view).
+# Extremely useful in immunology where one gene (e.g. IFNG) lights up
+# multiple pathways -- cnetplot makes that visually obvious.
+cnetplot(ora_results[["3"]], showCategory = 10)
+
+# Heatmap across clusters -- top GO terms per cluster in one picture.
+# Colour = -log10(q). Do NOT print numbers on top of the colour (common
+# mistake): colour IS the number.
+
+library(pheatmap)
+library(tidyr)
+
+top_n <- 10
+go_matrix <- purrr::imap_dfr(ora_results, function(ego, cl) {
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) return(NULL)
+  as.data.frame(ego) %>%
+    arrange(p.adjust) %>%
+    slice_head(n = top_n) %>%
+    mutate(cluster = cl, neg_log10_q = -log10(p.adjust)) %>%
+    select(term = Description, cluster, neg_log10_q)
+})
+
+go_wide <- go_matrix %>%
+  pivot_wider(names_from = cluster, values_from = neg_log10_q, values_fill = 0)
+
+mat <- as.matrix(go_wide[, -1])
+rownames(mat) <- go_wide$term
+
+pheatmap(
+  mat,
+  cluster_rows  = TRUE,
+  cluster_cols  = TRUE,
+  display_numbers = FALSE,
+  main          = "GO BP enrichment across clusters  (-log10 FDR)",
+  fontsize_row  = 7
+)
+
+
+# ==============================================================================
+# 7) GSEA -- WHEN AND WHY
+# ==============================================================================
+#
+# ORA has a hidden assumption: "there is a clean cut between interesting and
+# boring genes." You picked a threshold (p_adj < 0.05, logFC > 0.25), everything
+# above is IN, everything below is OUT. This is brittle.
+#
+# Example of the failure mode (very common in immunology):
+#   Suppose an interferon response pathway has 50 ISGs that are ALL modestly
+#   up (logFC 0.2, 0.15, 0.22, 0.18, ...). None individually pass your 0.25
+#   threshold. ORA: NOT ENRICHED. But the pathway is clearly coordinately
+#   up-regulated -- classic tonic IFN signature. GSEA will catch this. ORA
+#   will not. You will miss IFN biology if you rely on ORA alone.
+#
+# GSEA (Subramanian et al. PNAS 2005) does not threshold. You rank EVERY gene
+# by some statistic (log2FC, a t-statistic, whatever), then for each gene set
+# (e.g. each GO term) it walks down the ranked list and asks:
+#
+#     "Are genes from this set concentrated near the top (or bottom) of
+#      the ranking, more than a random walk would give?"
+#
+# THE MATHS, IN WORDS:
+#   1. Rank all genes by your stat (e.g. avg_log2FC).
+#   2. Walk down the ranked list. Every time you hit a gene IN the set,
+#      the running sum goes UP. Every gene NOT in the set, it goes DOWN.
+#      (Weights are proportional to |stat|, so big-FC hits nudge more.)
+#   3. The max deviation of that running sum from zero = enrichment score (ES).
+#   4. To get a p-value: permute the gene labels many times (default 1000)
+#      and see how often you get an ES this extreme by chance.
+#   5. Normalise the ES across gene sets of different sizes --> NES.
+#
+# So GSEA gives you:
+#   NES > 0   -->  set is enriched at the TOP of the ranking (up-regulated)
+#   NES < 0   -->  set is enriched at the BOTTOM (down-regulated)
+#   pvalue    -->  permutation p
+#   p.adjust  -->  BH-adjusted across all tested sets
+#
+# WHEN TO USE GSEA vs ORA:
+#
+#   ORA is right when:
+#     - you have a clear "interesting" list (e.g. strongly DE genes that
+#       passed QC) and you want quick interpretation
+#     - the lineage-defining genes (CD4, CD8A, FOXP3, etc) are what you
+#       care about and they ARE above threshold
+#
+#   GSEA is right when:
+#     - the biology is expected to be subtle / coordinated (cytokine
+#       signatures, exhaustion programs, M1/M2 polarisation, tonic signalling)
+#     - you have a proper ranked list
+#     - you care about direction (M1 up, M2 down? Treg suppression up,
+#       effector program down?)
+#
+# Most good single-cell immunology papers report BOTH. They complement.
+#
+# SUBTLE TRAP FOR SINGLE CELL:
+# Permutation in GSEA traditionally permutes SAMPLE labels in bulk RNA-seq.
+# In single-cell there are no "samples" in that sense -- clusterProfiler's
+# gseGO permutes GENE LABELS instead. This is more conservative and the
+# p-values behave differently. It's fine but don't compare raw p-values
+# between a bulk GSEA result and a single-cell one.
+
+
+# ==============================================================================
+# 8) GSEA IN PRACTICE
+# ==============================================================================
+#
+# For GSEA we want a signed ranking per cluster.
+# We use markers_both (only.pos = FALSE) so we have the down-regulated genes
+# too -- GSEA needs both tails of the ranking.
+
+gsea_results <- list()
+
+for (cl in clusters) {
+
+  # Build the ranked vector for this cluster: names = gene symbols,
+  # values = log2FC. Sort DECREASING (top of list = most up-regulated).
+  sub <- markers_both %>% filter(cluster == cl)
+
+  # Deduplicate just in case (same gene can't appear twice in a rank)
+  sub <- sub[!duplicated(sub$gene), ]
+
+  ranked <- sub$avg_log2FC
+  names(ranked) <- sub$gene
+  ranked <- sort(ranked, decreasing = TRUE)
+
+  message("Cluster ", cl, ": ranking ", length(ranked), " genes for GSEA")
+
+  if (length(ranked) < 100) {
+    message("  skipping -- ranking too short to be meaningful")
+    next
+  }
+
+  gsea <- gseGO(
+    geneList      = ranked,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    minGSSize     = 10,
+    maxGSSize     = 500,
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH",
+    verbose       = FALSE,
+    seed          = TRUE,              # reproducibility -- permutation is
+                                        # stochastic, set a seed
+    nPermSimple   = 10000              # more permutations = more stable
+                                        # p's for very small p-values
+  )
+
+  gsea_results[[as.character(cl)]] <- gsea
+}
+
+head(as.data.frame(gsea_results[["3"]]))
+
+# Key columns beyond ORA:
+#   NES             -- normalised enrichment score (the interpretable one)
+#   enrichmentScore -- raw ES (less comparable across sets)
+#   rank            -- position in ranked list where ES peaked
+#   leading_edge    -- "tags%, list%, signal%" triplet summarising where
+#                      the signal sits in the ranking
+#   core_enrichment -- THE MOST USEFUL COLUMN. The subset of genes from
+#                      the term that drove the enrichment (the leading-edge
+#                      genes). When you describe a result, describe these.
+
+
+# ==============================================================================
+# 9) VISUALISING GSEA
+# ==============================================================================
+
+# Dotplot split by direction of regulation (NES sign):
+dotplot(gsea_results[["3"]],
+        showCategory = 15,
+        split        = ".sign") +
+  facet_grid(. ~ .sign) +
+  ggtitle("Cluster 3 -- GSEA GO BP")
+
+# The GSEA plot EVERYBODY has seen (mountain/valley running-sum plot):
+gseaplot2(
+  gsea_results[["3"]],
+  geneSetID = 1,
+  title     = gsea_results[["3"]]@result$Description[1]
+)
+# Reading it: top panel = running sum (where it peaks = ES). Middle panel =
+# hits in the ranking (black ticks = genes in the set). Bottom panel = the
+# ranked stat (your log2FC sorted high-to-low).
+
+
+# ==============================================================================
+# 10) BONUS FOR IMMUNOLOGY: MSigDB C7 immunologic signatures
+# ==============================================================================
+#
+# GO is generic. MSigDB's C7 collection is specifically immunological
+# signatures (thousands of curated gene sets from published immunology
+# studies: "UP_IN_NAIVE_VS_MEMORY_CD8", "TREG_VS_TCONV", etc). If GO gives
+# you generic "lymphocyte activation", C7 can tell you which SPECIFIC
+# published immune state your cluster most resembles.
+#
+# You run it through the same clusterProfiler interface, just feeding it
+# MSigDB sets instead of GO:
+
+c7_sets <- msigdbr(species = "Homo sapiens", collection = "C7") %>%
+  dplyr::select(gs_name, gene_symbol)
+# (column names changed across msigdbr versions -- if the above errors,
+#  check the package vignette and adjust. Older versions used `category`
+#  instead of `collection`.)
+
+# ORA with MSigDB:
+gene_list_cl3 <- markers_for_ora %>% filter(cluster == 3) %>% pull(gene)
+
+c7_ora_cl3 <- enricher(
+  gene         = gene_list_cl3,
+  universe     = universe_genes,
+  TERM2GENE    = c7_sets,
+  pAdjustMethod= "BH",
+  qvalueCutoff = 0.05
+)
+
+head(as.data.frame(c7_ora_cl3))
+
+# GSEA with MSigDB:
+ranked_cl3 <- markers_both %>%
+  filter(cluster == 3) %>%
+  { setNames(.$avg_log2FC, .$gene) } %>%
+  sort(decreasing = TRUE)
+
+c7_gsea_cl3 <- GSEA(
+  geneList  = ranked_cl3,
+  TERM2GENE = c7_sets,
+  pvalueCutoff = 0.05
+)
+head(as.data.frame(c7_gsea_cl3))
+
+
+# ==============================================================================
+# 11) ORA vs GSEA -- SANITY COMPARE
+# ==============================================================================
+#
+# For the same cluster, how much do the top terms overlap between methods?
+# A lot of overlap = strong, robust signal. Low overlap = one method is
+# picking up something the other isn't, and you need to think about why.
+
+compare_top_terms <- function(ora, gsea, n = 20) {
+  ora_terms  <- as.data.frame(ora)  %>% arrange(p.adjust) %>% slice_head(n = n) %>% pull(Description)
+  gsea_terms <- as.data.frame(gsea) %>% arrange(p.adjust) %>% slice_head(n = n) %>% pull(Description)
+  list(
+    ora_only  = setdiff(ora_terms, gsea_terms),
+    gsea_only = setdiff(gsea_terms, ora_terms),
+    both      = intersect(ora_terms, gsea_terms)
+  )
+}
+
+compare_top_terms(ora_results[["3"]], gsea_results[["3"]])
+
+
+# ==============================================================================
+# 12) MANUAL / WEB-BASED CROSS-CHECKS
+# ==============================================================================
+#
+# R scripts are great but there is real value in clicking through a web tool.
+# It forces you to SEE each gene set, notice weird ones, and build intuition
+# for what results are real vs cosmetic. Three tools every immunology student
+# should know how to use:
+#
+#
+# -----------------------------------------------------------------------------
+# 12a) ENRICHR   (https://maayanlab.cloud/Enrichr/)
+# -----------------------------------------------------------------------------
+# The fastest way to sanity-check a gene list. Paste genes in, get enrichment
+# across ~200 libraries (GO BP, KEGG, Reactome, MSigDB, TF targets, drug
+# perturbations, cell-type atlases, etc).
+#
+# Workflow:
+#   1. Pull a cluster's top genes from R:
+#        cat(head(gene_list_cl3, 100), sep = "\n")
+#      Copy the printed list.
+#   2. Go to https://maayanlab.cloud/Enrichr/
+#   3. Paste into the left-hand input box. Click "Submit".
+#   4. On the results page, the tabs you actually want as an immunologist:
+#        - "Ontologies" tab      --> GO Biological Process 2023 (cross-check
+#                                     your R ORA results -- they should
+#                                     broadly agree)
+#        - "Pathways" tab        --> KEGG, Reactome, WikiPathways, BioPlanet
+#        - "Cell Types" tab      --> Human Gene Atlas, ARCHS4, Tabula Sapiens,
+#                                     PanglaoDB -- tells you "this gene list
+#                                     looks like naive B cells from dataset X"
+#        - "Diseases/Drugs" tab  --> LINCS L1000 perturbations. Useful for
+#                                     "what drug reproduces this signature"
+#        - "Legacy" tab          --> has the classic Immune Cell Atlas sets
+#
+#   5. Click a bar/row to see WHICH of your genes hit that term. Same reading
+#      rule as from R: if the genes don't make biological sense, the term
+#      isn't real.
+#
+# WHY USE ENRICHR EVEN IF YOU HAVE R:
+#   - It runs dozens of gene-set libraries in one click, including ones not
+#     conveniently wrapped in clusterProfiler (LINCS drug perturbations,
+#     ARCHS4 tissue expression, Allen Brain Atlas).
+#   - It's an excellent CROSS-CHECK. If Enrichr says "IFN response" but
+#     your enrichGO doesn't, something's off -- usually your universe or
+#     your gene symbols are wrong.
+#
+# WARNINGS:
+#   - Enrichr's default ranking metric is the "combined score", which is
+#     approximately p * log(odds ratio). It's an invention of the Enrichr
+#     authors (Chen et al. 2013, BMC Bioinformatics). It's fine for ranking
+#     but don't report the combined score as a p-value. Report the adjusted
+#     p-value column instead.
+#   - No universe control. Enrichr's background IS the genome. Same issue
+#     as sloppy ORA in R. Take low-count enrichments (Count < 5) with a
+#     grain of salt.
+#   - Programmatic access: there's an R wrapper called `enrichR` (note the
+#     capital R at the end) if you want to pull Enrichr results without
+#     leaving RStudio:
+#         install.packages("enrichR")
+#         library(enrichR)
+#         dbs <- listEnrichrDbs()
+#         enriched <- enrichr(gene_list_cl3, c("GO_Biological_Process_2023",
+#                                              "KEGG_2021_Human",
+#                                              "Reactome_2022"))
+#
+#
+# -----------------------------------------------------------------------------
+# 12b) CELLxGENE   (https://cellxgene.cziscience.com/)
+# -----------------------------------------------------------------------------
+# Not a GO tool -- but essential for the step BEFORE GO interpretation:
+# "does my cluster even look like the cell type I think it is?"
+#
+# CELLxGENE (by the Chan Zuckerberg Initiative) hosts hundreds of published
+# single-cell datasets with consistent cell type annotations. You can:
+#   - Find a dataset in your tissue of interest
+#   - Look up your gene(s) of interest (one at a time or a list)
+#   - See which annotated cell types express them, at what levels
+#
+# Workflow for an immunology student debugging a cluster:
+#   1. From R, pull your cluster's top 10-20 marker genes.
+#   2. Go to https://cellxgene.cziscience.com/
+#   3. Search collections for your tissue (e.g. "tonsil", "PBMC", "lymph
+#      node", "tumour-infiltrating").
+#   4. Open a relevant dataset. Use the "Gene expression" panel on the left.
+#   5. Type your marker genes in. Watch which annotated cell types light up.
+#   6. If your "Treg" cluster's markers light up CD8 T cells in three public
+#      datasets, you don't have Tregs. Back to the drawing board.
+#
+# This is the fastest way to catch mis-annotated clusters BEFORE you go
+# telling your PI that IL2RA+ cells are Tregs when they might be activated
+# effector T cells (IL2RA upregulates on activation too -- classic trap).
+#
+# GO analysis on a mis-annotated cluster will still "work" statistically --
+# you'll get enriched terms -- but you'll be explaining the wrong biology.
+# Always sanity-check the cluster identity before interpreting its pathways.
+#
+# Bonus: CELLxGENE also hosts the Census API (`cellxgene.census` in Python,
+# accessible from R via reticulate) if you want programmatic access to
+# millions of annotated cells for cross-dataset validation.
+#
+#
+# -----------------------------------------------------------------------------
+# 12c) THE GO WEBSITE ITSELF   (https://amigo.geneontology.org/amigo)
+# -----------------------------------------------------------------------------
+# Actually useful when you want to know "what IS this specific term".
+#
+# Say your enrichGO spits out GO:0045087 "innate immune response" and you
+# want to know:
+#   - exactly which genes are annotated to it
+#   - which PAPERS support each annotation (evidence codes!)
+#   - whether it has a more specific child term that fits your biology better
+#
+# Search AmiGO for the term ID or name. On the term page:
+#   - "Direct annotations" = genes directly curated to THIS term
+#   - "Annotations to descendant terms" = genes curated to children (inherited)
+#   - Evidence codes tell you how reliable each annotation is:
+#       IDA = Inferred from Direct Assay       (experimental, strong)
+#       IMP = Inferred from Mutant Phenotype   (experimental, strong)
+#       IEA = Inferred from Electronic Annotation  (computational, weaker)
+#       TAS = Traceable Author Statement       (review-article level)
+#   - The DAG view shows parent/child relationships. Useful for picking the
+#     RIGHT level of granularity to report.
+#
+# This is the "read the primary source" step. Not for every cluster, but
+# when you have one or two key terms driving your biological story, spend
+# ten minutes on AmiGO verifying the annotations are solid.
+
+
+# ==============================================================================
+# 13) COMMON MISTAKES -- THE "I GOT A RESULT BUT IT'S WRONG" CHECKLIST
+# ==============================================================================
+#
+# [ ] Did you set the universe explicitly? (Default = whole genome = bad)
+# [ ] Are gene symbols in your Seurat object matching org.Hs.eg.db's symbols?
+#     Mismatch examples: "HLA-DRB1" vs "HLA.DRB1", "C6orf132" vs "C6ORF132"
+#     --> check: sum(your_genes %in% keys(org.Hs.eg.db, "SYMBOL"))
+# [ ] Is species right? Mouse analysis with org.Hs.eg.db = garbage.
+# [ ] Is your cluster actually a cluster? If FindClusters resolution is too
+#     high you're just fitting noise, and GO will dutifully give you "noise".
+#     Cross-check cluster identity in CELLxGENE before interpreting GO.
+# [ ] Did you READ the geneID / core_enrichment column? If the genes don't
+#     make biological sense, the term isn't real, it's annotation artefact.
+# [ ] Did you correct p-values? Always report p.adjust, not p.
+# [ ] Did you treat redundant parent/child terms as independent findings?
+#     Don't. Use emapplot, simplify(), or click through AmiGO to collapse.
+# [ ] Did you claim "pathway X is ACTIVATED"? GO says enriched, not activated.
+#     Direction needs GSEA (NES sign) or a signed pathway tool like
+#     SCPA / PROGENy / DoRothEA for regulons.
+# [ ] Did you cross-check with a second tool (Enrichr or independent MSigDB
+#     run)? Results that replicate across methods are the ones to trust.
+
+
+# ==============================================================================
+# 14) WHERE TO GO NEXT (pun accidental)
+# ==============================================================================
+#
+# Once you are comfortable with GO, the same clusterProfiler interface does:
+#   - KEGG pathways          -- enrichKEGG() / gseKEGG()
+#   - Reactome               -- ReactomePA::enrichPathway() / gsePathway()
+#   - MSigDB hallmark (H) /
+#     canonical (C2) /
+#     immunologic (C7)       -- msigdbr + enricher() / GSEA()  (see sec 10)
+#   - WikiPathways           -- enrichWP()
+#   - your own custom sets   -- enricher(gene, TERM2GENE = your_table)
+#
+# Immunology-specific tools worth knowing about beyond GO:
+#   - SCPA (Single Cell Pathway Analysis)  -- pathway-level DE per cell
+#   - PROGENy                               -- 14 canonical signalling pathways
+#   - DoRothEA                              -- transcription factor activity
+#   - CellChat / LIANA / NicheNet           -- cell-cell signalling from
+#                                              ligand-receptor pairs
+#   - GSVA / ssGSEA                         -- per-cell pathway scoring
+#                                              (what Seurat's AddModuleScore
+#                                              is trying to do, but properly)
+#
+# Literature to actually read (not just cite):
+#   - Ashburner et al. 2000   Nat Genet         -- the original GO paper
+#   - Subramanian et al. 2005 PNAS              -- the original GSEA paper
+#   - Yu et al. 2012          OMICS             -- clusterProfiler
+#   - Wu et al. 2021          The Innovation    -- clusterProfiler 4.0 (current API)
+#   - Chen et al. 2013        BMC Bioinformatics-- the Enrichr paper
+#   - Reimand et al. 2019     Nat Protoc        -- "Pathway enrichment analysis
+#                                                   and visualization of omics
+#                                                   data using g:Profiler,
+#                                                   GSEA, Cytoscape and
+#                                                   EnrichmentMap" -- SINGLE
+#                                                   BEST practical guide that
+#                                                   exists. Read it.
+#
+# That's it. Run it once on a cluster whose identity you already trust (a
+# clean CD8 T cell cluster: CD8A+, CD3E+, GZMB+, PRF1+) and you should see
+# cytotoxicity / effector terms come up top. If the expected biology does
+# NOT come back, something is wrong with the pipeline, not with the biology.
+# Fix it before trusting any result on a cluster whose biology you DON'T
+# already know.
+#
+# ==============================================================================
